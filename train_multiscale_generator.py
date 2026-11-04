@@ -1,6 +1,5 @@
 import os
 import sys
-import copy
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
@@ -32,23 +31,6 @@ NEGATIVE_PROMPTS = [
 ]
 
 
-class EMA:
-    """
-    Maintains exponential moving average of generator weights for ultra-stable synthesis.
-    """
-    def __init__(self, model, decay=0.999):
-        self.decay = decay
-        self.shadow = copy.deepcopy(model)
-        self.shadow.eval()
-        for p in self.shadow.parameters():
-            p.requires_grad = False
-
-    def update(self, model):
-        with torch.no_grad():
-            for s_param, m_param in zip(self.shadow.parameters(), model.parameters()):
-                s_param.data.mul_(self.decay).add_(m_param.data, alpha=1.0 - self.decay)
-
-
 class StochasticJitter(nn.Module):
     def __init__(self, pad=4):
         super().__init__()
@@ -66,7 +48,6 @@ class StochasticJitter(nn.Module):
 def load_clip_model(device):
     os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
     
-    # Try open_clip
     try:
         import open_clip
         print("[CLIP Judge] Loading via open_clip (ViT-B-32)...")
@@ -93,7 +74,6 @@ def load_clip_model(device):
     except ImportError:
         pass
 
-    # Try transformers
     try:
         import transformers
         try:
@@ -165,23 +145,23 @@ def compute_text_matrices(encode_text_fn, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Multi-Scale Deconvolutional Decoder: Low & Slow 1000-Epoch Pre-training")
-    parser.add_argument("--epochs", type=int, default=1000, help="Training epochs (default: 1000 for low and slow refinement)")
-    parser.add_argument("--batches_per_epoch", type=int, default=20, help="Batches per epoch")
+    parser = argparse.ArgumentParser(description="Multi-Scale Deconvolutional Decoder: High-Contrast Pure Generator")
+    parser.add_argument("--epochs", type=int, default=500, help="Training epochs")
+    parser.add_argument("--batches_per_epoch", type=int, default=25, help="Batches per epoch")
     parser.add_argument("--samples_per_class", type=int, default=4, help="Samples per class in each batch (Batch size = 40)")
     parser.add_argument("--latent_dim", type=int, default=128, help="Latent noise vector dimension")
-    parser.add_argument("--lr", type=float, default=2e-4, help="Initial learning rate")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW weight decay")
-    parser.add_argument("--ema_decay", type=float, default=0.999, help="Generator EMA decay rate")
 
-    # Regularization weights
-    parser.add_argument("--lambda_align", type=float, default=2.0, help="CLIP cosine alignment weight")
+    # Regularization weights (Anti-Fog, High-Contrast Formulation)
+    parser.add_argument("--lambda_align", type=float, default=2.5, help="CLIP cosine alignment weight")
     parser.add_argument("--lambda_ce", type=float, default=1.0, help="CLIP contrastive classification weight")
     parser.add_argument("--lambda_coarse", type=float, default=0.5, help="Coarse 16x16 macro layout guidance weight")
-    parser.add_argument("--lambda_color", type=float, default=6.0, help="Natural image color moments matching weight")
-    parser.add_argument("--lambda_chroma", type=float, default=3.0, help="YUV chroma saturation suppression weight")
-    parser.add_argument("--lambda_neg", type=float, default=1.2, help="Negative prompt repulsion weight")
-    parser.add_argument("--lambda_tv", type=float, default=2.0, help="Total variation smoothness weight")
+    parser.add_argument("--lambda_contrast", type=float, default=4.0, help="Per-image contrast floor (prevents fog / wash-out)")
+    parser.add_argument("--lambda_color", type=float, default=2.0, help="Natural image color moments matching weight")
+    parser.add_argument("--lambda_chroma", type=float, default=1.0, help="Hinge chroma penalty (only kills neon glow)")
+    parser.add_argument("--lambda_neg", type=float, default=1.0, help="Negative prompt repulsion weight")
+    parser.add_argument("--lambda_tv", type=float, default=0.01, help="Light TV weight (no blur)")
     parser.add_argument("--lambda_div", type=float, default=0.04, help="Mode-seeking diversity weight")
 
     parser.add_argument("--output_dir", type=str, default="./results_multiscale_generator", help="Output directory")
@@ -201,19 +181,17 @@ def main():
     target_mean = torch.tensor([0.4914, 0.4822, 0.4465], device=device).view(1, 3, 1, 1)
     target_std = torch.tensor([0.2470, 0.2435, 0.2616], device=device).view(1, 3, 1, 1)
 
-    # 2. Multi-Scale Decoder Generator (From Scratch)
+    # 2. Multi-Scale Decoder Generator (Live model only, zero EMA blur)
     print("=" * 65)
-    print("MULTI-SCALE RESIDUAL DECODER GENERATOR (1000 EPOCHS LOW & SLOW)")
-    print("  Scale 1 (4x4):   Global compositional seed")
-    print("  Scale 2 (8x8):   Macro-shapes & horizon / sky / ground layout")
-    print("  Scale 3 (16x16): Mid-level textures, limbs, chassis")
-    print("  Scale 4 (32x32): Micro-edits, eyes, whiskers, crisp contours")
-    print(f"Batches/Epoch: {args.batches_per_epoch} | Batch Size: {args.samples_per_class * 10} | LR: {args.lr} (Cosine Annealing)")
+    print("HIGH-CONTRAST MULTI-SCALE DECODER (ANTI-FOG REVISED)")
+    print("  - EMA weight-averaging: REMOVED (preserves razor-sharp raw gradients)")
+    print("  - Total Variation blur: Slashed 200x (2.0 -> 0.01)")
+    print("  - Chroma Penalty: Hinge loss (preserves rich natural colors)")
+    print("  - Dynamic Range Floor: Active (enforces per-image contrast >= 0.22)")
+    print(f"Batches/Epoch: {args.batches_per_epoch} | Batch Size: {args.samples_per_class * 10}")
     print("=" * 65 + "\n")
 
     generator = MultiScaleDecoderGenerator(latent_dim=args.latent_dim, num_classes=10).to(device)
-    ema = EMA(generator, decay=args.ema_decay)
-
     optimizer = torch.optim.AdamW(generator.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
     jitter = StochasticJitter(pad=4).to(device)
@@ -229,11 +207,10 @@ def main():
 
         total_loss = 0.0
         total_cos_sim = 0.0
-        total_color_dev = 0.0
+        total_contrast = 0.0
         total_div = 0.0
 
         for _ in range(args.batches_per_epoch):
-            # Balanced multi-class batch: all 10 classes represented equally
             y_tensor = torch.arange(10, device=device).repeat_interleave(args.samples_per_class)
             perm = torch.randperm(batch_size, device=device)
             y_tensor = y_tensor[perm]
@@ -257,12 +234,12 @@ def main():
             img_embeds_32 = encode_image_fn(x_aug)
 
             # 3. Fine Scale Alignment & CE
-            sim_32 = torch.matmul(img_embeds_32, pos_matrix.t())  # (B, 10)
+            sim_32 = torch.matmul(img_embeds_32, pos_matrix.t())
             target_sims = sim_32.gather(1, y_tensor.unsqueeze(1)).squeeze(1)
             loss_align = (1.0 - target_sims).mean()
             loss_ce = F.cross_entropy(100.0 * sim_32, y_tensor)
 
-            # 4. Coarse Scale Alignment (16x16 forces macro composition early)
+            # 4. Coarse Scale Alignment (16x16 macro composition)
             img_embeds_16 = encode_image_fn(x16_1)
             sim_16 = torch.matmul(img_embeds_16, pos_matrix.t())
             target_sims_16 = sim_16.gather(1, y_tensor.unsqueeze(1)).squeeze(1)
@@ -272,24 +249,30 @@ def main():
             neg_sims = torch.matmul(img_embeds_32, neg_matrix.t()).max(dim=-1)[0]
             loss_neg = torch.relu(neg_sims).mean()
 
-            # 6. Natural Color Moments Matching (CIFAR Real Statistics)
+            # 6. Per-Image Contrast Floor (Prevents foggy / washed out collapse)
+            per_img_std = x32_1.std(dim=[-2, -1])  # (B, 3)
+            loss_contrast = torch.relu(0.22 - per_img_std).mean()
+
+            # 7. Natural Color Moments Matching
             batch_m = x32_1.mean(dim=[0, 2, 3], keepdim=True)
             batch_s = x32_1.std(dim=[0, 2, 3], keepdim=True)
             loss_color = F.mse_loss(batch_m, target_mean) + F.mse_loss(batch_s, target_std)
 
-            # 7. YUV Chroma / Saturation Suppression
+            # 8. Hinge Chroma Penalty (ONLY penalizes neon / psychedelic glow, preserves rich colors!)
             r, g, b = x32_1[:, 0:1], x32_1[:, 1:2], x32_1[:, 2:3]
             u = -0.147 * r - 0.289 * g + 0.436 * b
             v = 0.615 * r - 0.515 * g - 0.100 * b
-            loss_chroma = torch.mean(u ** 2 + v ** 2)
+            chroma = u ** 2 + v ** 2
+            loss_chroma = torch.relu(chroma - 0.08).mean()
 
-            # 8. Total Variation Smoothness
+            # 9. Light Total Variation (only kills single-pixel speckle)
             tv_loss = torch.mean(torch.abs(x32_1[:, :, :, :-1] - x32_1[:, :, :, 1:])) + \
                       torch.mean(torch.abs(x32_1[:, :, :-1, :] - x32_1[:, :, 1:, :]))
 
             loss_total = (args.lambda_align * loss_align) + \
                          (args.lambda_ce * loss_ce) + \
                          (args.lambda_coarse * loss_coarse) + \
+                         (args.lambda_contrast * loss_contrast) + \
                          (args.lambda_color * loss_color) + \
                          (args.lambda_chroma * loss_chroma) + \
                          (args.lambda_neg * loss_neg) + \
@@ -298,48 +281,40 @@ def main():
 
             loss_total.backward()
             optimizer.step()
-            ema.update(generator)
 
             total_loss += loss_total.item()
             total_cos_sim += target_sims.mean().item()
-            total_color_dev += loss_color.item()
+            total_contrast += per_img_std.mean().item()
             total_div += diff_img.item()
 
         scheduler.step()
 
         avg_loss = total_loss / args.batches_per_epoch
         avg_sim = total_cos_sim / args.batches_per_epoch
-        avg_col = total_color_dev / args.batches_per_epoch
+        avg_std = total_contrast / args.batches_per_epoch
         avg_div = total_div / args.batches_per_epoch
 
-        # Log and save grids
+        # Save sample grid every 25 epochs
         if epoch % 25 == 0 or epoch == 1:
-            print(f"Epoch {epoch:04d}/{args.epochs:04d} | Cos Sim: {avg_sim:.4f} | Color Dev: {avg_col:.4f} | Diff: {avg_div:.4f} | Loss: {avg_loss:.4f}")
+            print(f"Epoch {epoch:04d}/{args.epochs:04d} | Cos Sim: {avg_sim:.4f} | Contrast(std): {avg_std:.4f} | Diff: {avg_div:.4f} | Loss: {avg_loss:.4f}")
 
-            # Save live samples and EMA samples
             generator.eval()
-            ema.shadow.eval()
             with torch.no_grad():
-                samples_live = generator(fixed_z, fixed_y)
-                samples_ema = ema.shadow(fixed_z, fixed_y)
-
-                save_image(samples_live, os.path.join(args.output_dir, f"sample_live_epoch_{epoch:04d}.png"), nrow=5, normalize=False)
-                save_image(samples_ema, os.path.join(args.output_dir, f"sample_ema_epoch_{epoch:04d}.png"), nrow=5, normalize=False)
+                samples = generator(fixed_z, fixed_y)
+                save_image(samples, os.path.join(args.output_dir, f"sample_epoch_{epoch:04d}.png"), nrow=5, normalize=False)
 
         elif epoch % 5 == 0:
-            print(f"Epoch {epoch:04d}/{args.epochs:04d} | Cos Sim: {avg_sim:.4f} | Color Dev: {avg_col:.4f} | Diff: {avg_div:.4f} | Loss: {avg_loss:.4f}")
+            print(f"Epoch {epoch:04d}/{args.epochs:04d} | Cos Sim: {avg_sim:.4f} | Contrast(std): {avg_std:.4f} | Diff: {avg_div:.4f} | Loss: {avg_loss:.4f}")
 
         # Checkpoints every 100 epochs
         if epoch % 100 == 0:
             torch.save(generator.state_dict(), os.path.join(args.output_dir, f"generator_epoch_{epoch:04d}.pth"))
-            torch.save(ema.shadow.state_dict(), os.path.join(args.output_dir, "generator_multiscale_ema.pth"))
 
     # Final save
-    torch.save(generator.state_dict(), os.path.join(args.output_dir, "generator_multiscale_final.pth"))
-    torch.save(ema.shadow.state_dict(), os.path.join(args.output_dir, "generator_multiscale_ema.pth"))
-    print(f"\n>>> 1000-Epoch Training Complete! Final models and samples saved to: {args.output_dir}")
+    final_path = os.path.join(args.output_dir, "generator_multiscale_final.pth")
+    torch.save(generator.state_dict(), final_path)
+    print(f"\n>>> Training Complete! Final model saved to: {final_path}")
 
 
 if __name__ == "__main__":
     main()
-

@@ -2,6 +2,13 @@
 data/
 data/**
 
+# Ignore model checkpoints
+*.pth
+*.pt
+*.bin
+*.ckpt
+*.png
+
 # Ignore python bytecode & caches
 __pycache__/
 *.py[cod]
@@ -14,7 +21,10 @@ __pycache__/
 env/
 venv/
 
-# Explicitly ensure results_multiscale_generator is tracked
+# Track results directories and PNG images
 !results_multiscale_generator/
-!results_multiscale_generator/**
+!results_multiscale_generator/**.png
+!results_128_generator/
+!results_128_generator/**.png
+
 

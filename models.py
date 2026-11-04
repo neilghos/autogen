@@ -1,6 +1,20 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import timm
+
+
+def get_classifier(model_name="convnext_femto", pretrained=False, num_classes=10, in_chans=3):
+    """
+    Instantiates ConvNeXt Femto classifier.
+    """
+    model = timm.create_model(
+        model_name,
+        pretrained=pretrained,
+        num_classes=num_classes,
+        in_chans=in_chans
+    )
+    return model
 
 
 class DecoderResBlock(nn.Module):

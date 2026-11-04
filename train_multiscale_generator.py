@@ -19,12 +19,58 @@ CIFAR_CLASSES = [
     "dog", "frog", "horse", "ship", "truck"
 ]
 
-PROMPT_TEMPLATES = [
-    "a realistic daylight photo of a {}.",
-    "a natural color photograph of a {} in real life.",
-    "a clear authentic photo of a {} outdoors.",
-    "a sharp, detailed photo of a {}."
-]
+CLASS_DESCRIPTIONS = {
+    "airplane": [
+        "a commercial passenger airliner flying through clear blue sky, sharp fuselage and wings",
+        "a sleek modern jet airplane on airport runway tarmac in bright daylight",
+        "a sharp, detailed photo of a jet aircraft with wings and tail fin"
+    ],
+    "automobile": [
+        "a sleek sports car coupe with shiny paint, headlights and rubber wheels on road",
+        "a detailed photograph of a vintage automobile parked on street pavement",
+        "a clear photo of an automobile driving on tarmac highway in daylight"
+    ],
+    "bird": [
+        "a detailed macro photo of a songbird with sharp beak, dark eye and colorful plumage",
+        "a small colorful wild bird perched alert on a tree branch with blurred foliage",
+        "a vivid close up portrait of an authentic wild bird in nature"
+    ],
+    "cat": [
+        "a close up portrait of a furry domestic cat with pointed ears, whiskers and bright eyes",
+        "a cute tabby cat sitting upright in natural daylight, sharp focus on fur",
+        "an authentic photograph of a domestic cat outdoors in green garden"
+    ],
+    "deer": [
+        "a majestic wild deer stag with antlers and white throat standing in tall green grass",
+        "a clear wildlife photo of a golden brown deer standing alert in forest meadow",
+        "a close up portrait of a wild fawn deer in sunlight outdoors"
+    ],
+    "dog": [
+        "a close up portrait of a happy domestic dog with floppy ears, dark nose and soft fur",
+        "a golden retriever puppy dog looking at camera in sunny green park",
+        "an authentic photograph of a friendly dog outdoors on grass"
+    ],
+    "frog": [
+        "a vivid green tree frog with glistening skin and bulbous eyes perched on moss",
+        "a macro photograph of a colorful amphibian bullfrog in outdoor natural wetland",
+        "a clear close up of a small green frog sitting alert on green leaf"
+    ],
+    "horse": [
+        "a strong chestnut brown horse stallion standing in a lush green pasture",
+        "a full body photo of a noble equine horse with flowing mane and hooves on grass",
+        "a majestic brown mare horse in sunny meadow outdoors"
+    ],
+    "ship": [
+        "a tall wooden galleon sailing ship with white sails on deep blue sea water",
+        "a large maritime passenger ocean vessel floating on ocean waves in daylight",
+        "an authentic photograph of a majestic ship sailing on open water"
+    ],
+    "truck": [
+        "a heavy duty commercial freight cargo truck with front grill and big tires on asphalt",
+        "a large transport semi-truck parked outdoors on concrete road in sunlight",
+        "a clear photo of a motor truck vehicle on highway pavement"
+    ]
+}
 
 NEGATIVE_PROMPTS = [
     "neon, purple, magenta, violet, glowing, oversaturated, psychedelic, cartoon, illustration, drawing, abstract, distorted, surreal, inverted colors"
@@ -131,7 +177,7 @@ def compute_text_matrices(encode_text_fn, device):
     class_embeds = []
     with torch.no_grad():
         for c in CIFAR_CLASSES:
-            prompts = [t.format(c) for t in PROMPT_TEMPLATES]
+            prompts = CLASS_DESCRIPTIONS[c]
             embs = encode_text_fn(prompts)
             avg_emb = F.normalize(embs.mean(dim=0), dim=-1)
             class_embeds.append(avg_emb)
@@ -153,10 +199,11 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW weight decay")
 
-    # Regularization weights (Anti-Fog, High-Contrast Formulation)
-    parser.add_argument("--lambda_align", type=float, default=2.5, help="CLIP cosine alignment weight")
+    # Regularization & Goal-Seeking Target Margin weights
+    parser.add_argument("--target_sim", type=float, default=0.75, help="Target cosine similarity margin (default: 0.75)")
+    parser.add_argument("--lambda_align", type=float, default=12.0, help="Quadratic margin pull weight (default: 12.0)")
     parser.add_argument("--lambda_ce", type=float, default=1.0, help="CLIP contrastive classification weight")
-    parser.add_argument("--lambda_coarse", type=float, default=0.5, help="Coarse 16x16 macro layout guidance weight")
+    parser.add_argument("--lambda_coarse", type=float, default=1.0, help="Coarse 16x16 macro layout guidance weight")
     parser.add_argument("--lambda_contrast", type=float, default=4.0, help="Per-image contrast floor (prevents fog / wash-out)")
     parser.add_argument("--lambda_color", type=float, default=2.0, help="Natural image color moments matching weight")
     parser.add_argument("--lambda_chroma", type=float, default=1.0, help="Hinge chroma penalty (only kills neon glow)")
@@ -174,20 +221,19 @@ def main():
     # 1. Load CLIP Semantic Judge
     encode_text_fn, encode_image_fn = load_clip_model(device)
     pos_matrix, neg_matrix = compute_text_matrices(encode_text_fn, device)
-    print(f"[CLIP Judge] Positive anchors locked: {pos_matrix.shape}")
+    print(f"[CLIP Judge] High-Information Visual Anchors locked: {pos_matrix.shape}")
     print(f"[CLIP Judge] Negative repulsion locked: {neg_matrix.shape}\n")
 
     # Natural color statistics target (from real CIFAR-10)
     target_mean = torch.tensor([0.4914, 0.4822, 0.4465], device=device).view(1, 3, 1, 1)
     target_std = torch.tensor([0.2470, 0.2435, 0.2616], device=device).view(1, 3, 1, 1)
 
-    # 2. Multi-Scale Decoder Generator (Live model only, zero EMA blur)
+    # 2. Multi-Scale Decoder Generator (32x32)
     print("=" * 65)
-    print("HIGH-CONTRAST MULTI-SCALE DECODER (ANTI-FOG REVISED)")
-    print("  - EMA weight-averaging: REMOVED (preserves razor-sharp raw gradients)")
-    print("  - Total Variation blur: Slashed 200x (2.0 -> 0.01)")
-    print("  - Chroma Penalty: Hinge loss (preserves rich natural colors)")
-    print("  - Dynamic Range Floor: Active (enforces per-image contrast >= 0.22)")
+    print("MULTI-SCALE DECODER: SUPERCHARGED QUADRATIC MARGIN PULL")
+    print(f"  - Target Cosine Goal: {args.target_sim:.2f}")
+    print(f"  - Quadratic Pull Weight (lambda_align): {args.lambda_align:.1f}")
+    print(f"  - Visually Rich Class Prompt Ensembles: ACTIVE")
     print(f"Batches/Epoch: {args.batches_per_epoch} | Batch Size: {args.samples_per_class * 10}")
     print("=" * 65 + "\n")
 
@@ -236,14 +282,16 @@ def main():
             # 3. Fine Scale Alignment & CE
             sim_32 = torch.matmul(img_embeds_32, pos_matrix.t())
             target_sims = sim_32.gather(1, y_tensor.unsqueeze(1)).squeeze(1)
-            loss_align = (1.0 - target_sims).mean()
+
+            # Quadratic Goal-Seeking Margin Pull towards target_sim (0.75)
+            loss_align = torch.mean(torch.relu(args.target_sim - target_sims) ** 2)
             loss_ce = F.cross_entropy(100.0 * sim_32, y_tensor)
 
             # 4. Coarse Scale Alignment (16x16 macro composition)
             img_embeds_16 = encode_image_fn(x16_1)
             sim_16 = torch.matmul(img_embeds_16, pos_matrix.t())
             target_sims_16 = sim_16.gather(1, y_tensor.unsqueeze(1)).squeeze(1)
-            loss_coarse = (1.0 - target_sims_16).mean()
+            loss_coarse = torch.mean(torch.relu(0.60 - target_sims_16) ** 2)
 
             # 5. Negative Prompt Repulsion
             neg_sims = torch.matmul(img_embeds_32, neg_matrix.t()).max(dim=-1)[0]

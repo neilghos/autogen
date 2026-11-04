@@ -1,0 +1,20 @@
+# Ignore raw datasets
+data/
+data/**
+
+# Ignore python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# Explicitly ensure results_multiscale_generator is tracked
+!results_multiscale_generator/
+!results_multiscale_generator/**
+

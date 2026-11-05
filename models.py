@@ -54,22 +54,17 @@ class DecoderResBlock(nn.Module):
 
 class MultiScaleDecoderGenerator(nn.Module):
     """
-    Multi-Scale Progressive Decoder Generator (3x128x128).
+    Recurrent Feedback Multi-Scale Decoder Generator (3x128x128).
     
-    Architecture Hierarchy:
-      - Latent Mapping Network: [z (128) + y_emb (64)] -> w (256)
-      - Stage 1 (4x4, 256ch):    Initial spatial seed (global class composition)
-      - Stage 2 (8x8, 192ch):    Upsample + ResBlock -> Coarse RGB (8x8 macro-shapes, horizon/sky/ground)
-      - Stage 3 (16x16, 128ch):  Upsample + ResBlock -> Mid-level RGB (16x16 limbs, wheels, textures)
-      - Stage 4 (32x32, 96ch):   Upsample + ResBlock -> Anatomy RGB (32x32 object contour, primary features)
-      - Stage 5 (64x64, 64ch):   Upsample + ResBlock -> Surface RGB (64x64 textures, plumage, reflections)
-      - Stage 6 (128x128, 32ch): Upsample + ResBlock -> Fine RGB (128x128 micro-edits, eyes, crisp contours)
-      
-    Multi-Scale RGB Skip Paths ensure gradient flow directly into every resolution tier.
+    Iterative Autoregressive Refinement:
+      - Step 1: Seeds initial canvas (coarse silhouette, layout) from (z, c)
+      - Step 2+: Feeds previous canvas back into 4x4 stem via feedback residual connection,
+                 enabling self-observation, error correction, and multi-stage refinement.
     """
     def __init__(self, latent_dim=128, num_classes=10, embed_dim=64, base_channels=256):
         super().__init__()
         self.latent_dim = latent_dim
+        self.base_channels = base_channels
         self.label_emb = nn.Embedding(num_classes, embed_dim)
         
         # 1. Conditioning Mapping MLP
@@ -86,36 +81,38 @@ class MultiScaleDecoderGenerator(nn.Module):
             nn.BatchNorm1d(base_channels * 4 * 4),
             nn.LeakyReLU(0.2, inplace=True)
         )
-        self.base_channels = base_channels
         
-        # 3. Stage 2: 4x4 -> 8x8 (Macro shapes)
+        # 3. Recurrent Feedback Stem (projects previous 128x128 canvas back into 4x4 residual)
+        self.feedback_stem = nn.Sequential(
+            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.Conv2d(3, base_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(base_channels),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        # Initialize feedback projection gently
+        nn.init.zeros_(self.feedback_stem[1].weight)
+        
+        # 4. Stage 2: 4x4 -> 8x8 (Macro shapes)
         self.block_8 = DecoderResBlock(base_channels, 192, upsample=True)
         self.to_rgb_8 = nn.Conv2d(192, 3, kernel_size=1)
         
-        # 4. Stage 3: 8x8 -> 16x16 (Mid-level parts)
+        # 5. Stage 3: 8x8 -> 16x16 (Mid-level parts)
         self.block_16 = DecoderResBlock(192, 128, upsample=True)
         self.to_rgb_16 = nn.Conv2d(128, 3, kernel_size=1)
         
-        # 5. Stage 4: 16x16 -> 32x32 (Anatomy & shapes)
+        # 6. Stage 4: 16x16 -> 32x32 (Anatomy & shapes)
         self.block_32 = DecoderResBlock(128, 96, upsample=True)
         self.to_rgb_32 = nn.Conv2d(96, 3, kernel_size=1)
 
-        # 6. Stage 5: 32x32 -> 64x64 (Surface details)
+        # 7. Stage 5: 32x32 -> 64x64 (Surface details)
         self.block_64 = DecoderResBlock(96, 64, upsample=True)
         self.to_rgb_64 = nn.Conv2d(64, 3, kernel_size=1)
 
-        # 7. Stage 6: 64x64 -> 128x128 (Micro-edits, crisp contours)
+        # 8. Stage 6: 64x64 -> 128x128 (Micro-edits, crisp contours)
         self.block_128 = DecoderResBlock(64, 32, upsample=True)
         self.to_rgb_128 = nn.Conv2d(32, 3, kernel_size=3, padding=1)
 
-    def forward(self, z, labels, return_all_scales=False):
-        c = self.label_emb(labels)
-        cond = torch.cat([z, c], dim=-1)
-        w = self.mapping(cond)
-        
-        # Stage 1: 4x4
-        h4 = self.init_fc(w).view(z.size(0), self.base_channels, 4, 4)
-        
+    def _decode_from_h4(self, h4):
         # Stage 2: 8x8
         h8 = self.block_8(h4)
         rgb_8 = self.to_rgb_8(h8)
@@ -136,8 +133,30 @@ class MultiScaleDecoderGenerator(nn.Module):
         h128 = self.block_128(h64)
         rgb_128 = self.to_rgb_128(h128) + F.interpolate(rgb_64, scale_factor=2, mode='bilinear', align_corners=False)
         
-        out_128 = torch.sigmoid(rgb_128)
+        return rgb_128, rgb_64, rgb_32
+
+    def forward(self, z, labels, steps=2, return_all_scales=False):
+        c = self.label_emb(labels)
+        cond = torch.cat([z, c], dim=-1)
+        w = self.mapping(cond)
         
+        # Stage 1: 4x4 initial spatial seed
+        h4_base = self.init_fc(w).view(z.size(0), self.base_channels, 4, 4)
+        
+        canvas = None
+        out_128, out_64, out_32 = None, None, None
+        
+        for step in range(steps):
+            if step == 0:
+                h4 = h4_base
+            else:
+                # Recurrent feedback: add previous canvas back as a residual connection into the 4x4 stem
+                h4 = h4_base + self.feedback_stem(canvas)
+                
+            rgb_128, rgb_64, rgb_32 = self._decode_from_h4(h4)
+            out_128 = torch.sigmoid(rgb_128)
+            canvas = out_128
+            
         if return_all_scales:
             out_64 = torch.sigmoid(rgb_64)
             out_32 = torch.sigmoid(rgb_32)

@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.utils import save_image
+import timm
 
 from models import MultiScaleDecoderGenerator
 
@@ -34,57 +35,68 @@ CIFAR_CLASSES = [
     "dog", "frog", "horse", "ship", "truck"
 ]
 
+# Mapping from CIFAR-10 classes to ImageNet-1k synsets for ConvNeXt spatial supervision
+CIFAR_TO_IMAGENET = {
+    0: [404, 895],                                                         # airplane: airliner, warplane
+    1: [436, 468, 511, 609, 627, 656, 751, 817],                           # automobile: wagon, cab, convertible, jeep, limo, minivan, racer, sports car
+    2: list(range(8, 25)) + list(range(80, 101)) + list(range(127, 147)),  # bird: songbirds, raptors, waterfowl, poultry
+    3: [281, 282, 283, 284, 285],                                          # cat: tabby, tiger cat, Persian, Siamese, Egyptian
+    4: [351, 352, 353, 350, 349],                                          # deer: hartebeest, impala, gazelle, ibex, bighorn
+    5: list(range(151, 269)),                                              # dog: all 118 domestic dog breeds
+    6: [25, 30, 31, 32],                                                   # frog: toad, bullfrog, tree frog, tailed frog
+    7: [339, 340],                                                         # horse: sorrel horse, zebra
+    8: [403, 510, 625, 724, 814, 871],                                    # ship: aircraft carrier, container ship, lifeboat, pirate ship, speedboat, trimaran
+    9: [555, 569, 717, 734, 864, 867],                                    # truck: fire engine, garbage truck, pickup, police van, tow truck, trailer truck
+}
+
 # ==============================================================================
 # MULTI-SCALE CURRICULUM PROMPT SYSTEM (250 Epochs per Phase)
 # ==============================================================================
 
-# Phase 1 (Epochs 1 - 250): Macro Global Scene & Silhouette
-# Establishes horizon line, ground plane, lighting direction, and overall object bounding volume.
+# Phase 1 (Epochs 1 - 250): Full Scene & Complete Bounding Box
 CURRICULUM_PHASE_1_MACRO = [
-    "a wide angle photo of a passenger airplane parked on airport tarmac under clear daylight sky",
-    "a wide angle photo of an automobile car driving on an open asphalt road in daylight",
-    "a wide angle photo of a wild songbird perched outdoors in natural forest scenery",
-    "a wide angle photo of a domestic cat sitting on green grass lawn in natural daylight",
-    "a wide angle photo of a wild deer standing in an open grassy forest meadow",
-    "a wide angle photo of a domestic dog standing on a green grass field outdoors",
-    "a wide angle photo of a green amphibian frog resting in a natural wet outdoor environment",
-    "a wide angle photo of an equine horse standing in a rural grassy pasture",
-    "a wide angle photo of a wooden sailing ship floating on open ocean water under daytime sky",
-    "a wide angle photo of a commercial freight motor truck driving on a paved highway road"
+    "a wide angle photo of a complete passenger airplane parked on airport tarmac under clear daylight sky",
+    "a wide angle photo of a complete automobile car centered driving on an open asphalt road in daylight",
+    "a wide angle photo of a complete wild songbird perched outdoors in natural forest scenery",
+    "a wide angle photo of a complete domestic cat sitting on green grass lawn in natural daylight",
+    "a wide angle photo of a complete wild deer standing in an open grassy forest meadow",
+    "a wide angle photo of a complete domestic dog standing on a green grass field outdoors",
+    "a wide angle photo of a complete green amphibian frog resting in a natural wet outdoor environment",
+    "a wide angle photo of a complete equine horse standing in a rural grassy pasture",
+    "a wide angle photo of a complete wooden sailing ship floating on open ocean water under daytime sky",
+    "a wide angle photo of a complete commercial freight motor truck driving on a paved highway road"
 ]
 
 # Phase 2 (Epochs 251 - 500): Structural Anatomy, Contours & Primary Parts
-# Sharpens body parts, limb morphology, wings, wheels, windshield, mast, and clean boundaries.
 CURRICULUM_PHASE_2_ANATOMY = [
-    "a sharp focused photo of a passenger airplane showing wings, fuselage body, cockpit, and tail fin",
-    "a sharp focused photo of an automobile car showing vehicle body doors, windshield glass, hood, and wheels",
-    "a sharp focused photo of a wild bird showing head, beak, wings, tail feathers, and perched legs",
-    "a sharp focused photo of a domestic cat showing pointed ears, head profile, feline body, and tail",
-    "a sharp focused photo of a wild deer showing head with branched antlers, four slender legs, and body",
-    "a sharp focused photo of a domestic dog showing canine head, muzzle, ears, four legs, and body profile",
-    "a sharp focused photo of a green tree frog showing frog head with protruding eyes, moist throat, and legs",
-    "a sharp focused photo of an equine horse showing muscular neck, head, equestrian body, and four legs",
-    "a sharp focused photo of a wooden sailing ship showing carved ship hull, tall masts, and rigging sails",
-    "a sharp focused photo of a commercial motor truck showing truck cab, front grille, side mirrors, and wheels"
+    "a sharp focused photo of a whole passenger airplane showing wings, fuselage body, cockpit, and tail fin",
+    "a sharp focused photo of an entire automobile car showing vehicle body doors, windshield glass, hood, and wheels",
+    "a sharp focused photo of an entire wild bird showing head, beak, wings, tail feathers, and perched legs",
+    "a sharp focused photo of a full body domestic cat showing pointed ears, head profile, feline body, and tail",
+    "a sharp focused photo of a full body wild deer showing head with branched antlers, four slender legs, and torso",
+    "a sharp focused photo of a full body domestic dog showing canine head, muzzle, ears, four legs, and tail",
+    "a sharp focused photo of an entire green tree frog showing frog head with protruding eyes, moist throat, and legs",
+    "a sharp focused photo of a full body equine horse showing muscular neck, head, equestrian body, and four legs",
+    "a sharp focused photo of an entire wooden sailing ship showing carved ship hull, tall masts, and rigging sails",
+    "a sharp focused photo of an entire commercial motor truck showing truck cab, front grille, side mirrors, and wheels"
 ]
 
-# Phase 3 (Epochs 501+): Micro-Textures, Surface Speculars & Fine Physics
-# Drills into 1-pixel micro-details: glistening skin pores, rivets, tire treads, hair strands, feathers.
+# Phase 3 (Epochs 501+): Micro-Textures, Surface Speculars & Fine Physics (Applied strictly to patch crops)
 CURRICULUM_PHASE_3_MICRO = [
-    "a macro close up photo of passenger airplane polished aluminum rivets, jet engine intake turbine, and wing seams",
-    "a macro close up photo of automobile deep rubber tire tread grooves, alloy wheel rims, and glass headlights",
-    "a macro close up photo of wild bird plumage feather barbules, dark pupil eye, and sharp pointed beak",
-    "a macro close up photo of domestic cat whiskers, dense soft fur coat fibers, and inner ear hair",
-    "a macro close up photo of wild deer antler tines, soft velvet coat texture, and alert dark eyes",
-    "a macro close up photo of domestic dog textured wet nose leather, fine muzzle whiskers, and soft fur",
-    "a macro close up photo of green tree frog glistening wet skin texture, golden rimmed eye, and throat skin",
-    "a macro close up photo of horse silky flowing mane hair strands, glossy coat highlights, and dark eyes",
-    "a macro close up photo of sailing ship wooden hull planks, textured ropes, and woven fabric sails",
-    "a macro close up photo of heavy commercial truck chrome front grill, large tire treads, and side mirrors"
+    "detailed texture of passenger airplane polished aluminum rivets, jet engine intake turbine, and wing seams",
+    "detailed texture of automobile deep rubber tire tread grooves, alloy wheel rims, and glass headlights",
+    "detailed texture of wild bird plumage feather barbules, dark pupil eye, and sharp pointed beak",
+    "detailed texture of domestic cat whiskers, dense soft fur coat fibers, and inner ear hair",
+    "detailed texture of wild deer antler tines, soft velvet coat texture, and alert dark eyes",
+    "detailed texture of domestic dog textured wet nose leather, fine muzzle whiskers, and soft fur",
+    "detailed texture of green tree frog glistening wet skin texture, golden rimmed eye, and throat skin",
+    "detailed texture of horse silky flowing mane hair strands, glossy coat highlights, and dark eyes",
+    "detailed texture of sailing ship wooden hull planks, textured ropes, and woven fabric sails",
+    "detailed texture of heavy commercial truck chrome front grill, large tire treads, and side mirrors"
 ]
 
 NEGATIVE_PROMPTS = [
-    "blurry, foggy, out of focus, low contrast, abstract dots, scanlines, distorted, surreal cartoon, blown out white, overexposed, washed out"
+    "cropped, extreme close up, zoomed in, macro, severed head, headless, dismembered, detached parts, tire only, wheel only, floating pieces, blurry, foggy, out of focus, low contrast, abstract dots, scanlines, distorted, surreal cartoon, blown out white, overexposed, washed out"
 ]
 
 
@@ -176,6 +188,20 @@ def load_siglip_judge(device):
     return tokenizer, model
 
 
+def load_spatial_critic(device):
+    """
+    Loads frozen pretrained ConvNeXt Femto (convnext_femto.d1_in1k) in FP16.
+    Enforces global 3D geometric coherence and full-object topology.
+    """
+    print("[Spatial Critic] Loading ConvNeXt Femto (convnext_femto.d1_in1k)...")
+    model = timm.create_model("convnext_femto.d1_in1k", pretrained=True).to(device)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    print("[Spatial Critic] Loaded successfully and frozen.\n")
+    return model
+
+
 def encode_prompts(prompts, tokenizer, model, device):
     """Encodes a list of prompts into normalized FP16 SigLIP embeddings."""
     if hasattr(model, "get_text_features"):
@@ -191,11 +217,7 @@ def encode_prompts(prompts, tokenizer, model, device):
 
 def precompute_curriculum_anchors(tokenizer, model, device):
     """
-    Precomputes normalized SigLIP text embeddings for all 3 curriculum phases:
-      1. Phase 1: Macro Global Composition (1-250)
-      2. Phase 2: Structural Anatomy & Contours (251-500)
-      3. Phase 3: Micro-Textures & Fine Physics (501+)
-      4. Negative repulsion prompts
+    Precomputes normalized SigLIP text embeddings for all 3 curriculum phases.
     """
     print("[Curriculum Engine] Precomputing multi-scale prompt embeddings...")
     embeds_p1 = encode_prompts(CURRICULUM_PHASE_1_MACRO, tokenizer, model, device)
@@ -210,18 +232,20 @@ def precompute_curriculum_anchors(tokenizer, model, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Google SigLIP Multi-Scale Curriculum Synthesis")
+    parser = argparse.ArgumentParser(description="Recurrent Feedback Generator with SigLIP + ConvNeXt")
     parser.add_argument("--epochs", type=int, default=750, help="Total training epochs (Default: 750 = 3 x 250 phases)")
     parser.add_argument("--phase_length", type=int, default=250, help="Epoch duration for each curriculum phase")
     parser.add_argument("--batches_per_epoch", type=int, default=15, help="Batches per epoch")
     parser.add_argument("--samples_per_class", type=int, default=2, help="Samples per class per batch (Default: 2 -> Batch size = 20)")
     parser.add_argument("--latent_dim", type=int, default=128, help="Latent noise vector dimension")
+    parser.add_argument("--steps", type=int, default=2, help="Recurrent feedback steps per image (Default: 2)")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW weight decay")
 
-    # High-Frequency Details & Edge Loss Weights
+    # Supervision & Loss Weights
     parser.add_argument("--lambda_siglip", type=float, default=5.0, help="Weight for Global SigLIP Alignment")
     parser.add_argument("--lambda_patch", type=float, default=2.5, help="Weight for Zoomed Patch Details")
+    parser.add_argument("--lambda_spatial", type=float, default=2.0, help="Weight for ConvNeXt Spatial Critic")
     parser.add_argument("--lambda_sharpness", type=float, default=4.0, help="Weight for Laplacian Edge Floor")
     parser.add_argument("--lambda_contrast", type=float, default=3.0, help="Dynamic range contrast weight")
     parser.add_argument("--lambda_exposure", type=float, default=2.0, help="Anti-washout highlight/shadow penalty")
@@ -245,24 +269,36 @@ def main():
     tokenizer, siglip = load_siglip_judge(device)
     embeds_p1, embeds_p2, embeds_p3, neg_embeds = precompute_curriculum_anchors(tokenizer, siglip, device)
 
-    # SigLIP standard normalization: [-1, 1]
+    # 2. Load Pretrained ConvNeXt Spatial Critic
+    spatial_critic = load_spatial_critic(device)
+
+    # Construct vectorized CIFAR -> ImageNet 1k probability projection matrix
+    cifar_imagenet_mask = torch.zeros(10, 1000, device=device)
+    for c, idxs in CIFAR_TO_IMAGENET.items():
+        cifar_imagenet_mask[c, idxs] = 1.0
+
+    # Normalization statistics
     siglip_mean = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
     siglip_std = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
+
+    imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    imagenet_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
     # Natural color statistics target (from real CIFAR-10)
     target_mean = torch.tensor([0.4914, 0.4822, 0.4465], device=device).view(1, 3, 1, 1)
     target_std = torch.tensor([0.2470, 0.2435, 0.2616], device=device).view(1, 3, 1, 1)
 
-    # 2. Multi-Scale Decoder Generator (128x128)
+    # 3. Recurrent Feedback Decoder Generator (128x128)
     batch_size = 10 * args.samples_per_class
     print("=" * 72)
-    print("MULTI-SCALE CURRICULUM SYNTHESIS ENGINE")
+    print("RECURRENT FEEDBACK AUTOREGRESSIVE GENERATOR")
     print(f"  - Canvas Resolution: 128 x 128 native pixels")
+    print(f"  - Feedback Recurrence Steps: {args.steps} iterations / image")
     print(f"  - Phase Length: {args.phase_length} epochs each")
-    print(f"    * Phase 1 (1 - {args.phase_length}): Macro Global Scene & Silhouettes")
+    print(f"    * Phase 1 (1 - {args.phase_length}): Full Scene & Complete Bounding Box")
     print(f"    * Phase 2 ({args.phase_length + 1} - {2 * args.phase_length}): Structural Anatomy & Contours")
     print(f"    * Phase 3 ({2 * args.phase_length + 1}+): Micro-Textures & Fine Physics")
-    print(f"  - Anti-Washout Exposure Guard: ACTIVE (Prevents highlight blowouts)")
+    print(f"  - Spatial Topology Critic: ConvNeXt Femto (ImageNet-1k) Active (Weight: {args.lambda_spatial})")
     print(f"  - Batches/Epoch: {args.batches_per_epoch} | Batch Size: {batch_size}")
     print("=" * 72 + "\n")
 
@@ -270,7 +306,7 @@ def main():
     optimizer = torch.optim.AdamW(generator.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
 
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda') if hasattr(torch.amp, 'GradScaler') else torch.cuda.amp.GradScaler()
     jitter = StochasticJitter(pad=8, img_size=128).to(device)
     laplacian = LaplacianSharpness().to(device)
 
@@ -287,7 +323,7 @@ def main():
         # Determine Curriculum Phase
         if epoch <= args.phase_length:
             active_phase = 1
-            phase_title = "Phase 1: Macro Global Composition"
+            phase_title = "Phase 1: Full Scene & Complete Bounding Box"
             active_global_embeds = embeds_p1
             active_patch_embeds = embeds_p1
             crop_min, crop_max = 64, 96
@@ -299,9 +335,9 @@ def main():
             crop_min, crop_max = 56, 84
         else:
             active_phase = 3
-            phase_title = "Phase 3: Micro-Textures & Surface Physics"
-            active_global_embeds = embeds_p2  # Anchor global view to anatomy
-            active_patch_embeds = embeds_p3   # Zoomed patches focus on micro textures
+            phase_title = "Phase 3: Micro-Textures & Fine Physics"
+            active_global_embeds = embeds_p2
+            active_patch_embeds = embeds_p3
             crop_min, crop_max = 48, 72
 
         if active_phase != current_phase:
@@ -314,6 +350,8 @@ def main():
 
         total_loss = 0.0
         total_siglip_loss = 0.0
+        total_spatial_loss = 0.0
+        total_spatial_conf = 0.0
         total_sim = 0.0
         total_edge = 0.0
         total_div = 0.0
@@ -328,9 +366,9 @@ def main():
 
             optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast(dtype=torch.float16):
-                x128_1, x64_1, _ = generator(z1, y_tensor, return_all_scales=True)
-                x128_2, _, _ = generator(z2, y_tensor, return_all_scales=True)
+            with torch.amp.autocast('cuda', dtype=torch.float16) if hasattr(torch.amp, 'autocast') else torch.cuda.amp.autocast(dtype=torch.float16):
+                x128_1, x64_1, _ = generator(z1, y_tensor, steps=args.steps, return_all_scales=True)
+                x128_2, _, _ = generator(z2, y_tensor, steps=args.steps, return_all_scales=True)
 
                 # 1. Mode-seeking diversity
                 diff_z = torch.abs(z1 - z2).mean()
@@ -357,7 +395,16 @@ def main():
                 loss_siglip = F.binary_cross_entropy_with_logits(logits, target_mask)
                 target_sims = sims.gather(1, y_tensor.unsqueeze(1)).squeeze(1)
 
-                # 4. MULTI-CROP ZOOMED PATCH DETAIL (Phase-Specific)
+                # 4. SPATIAL CONVNEXT CRITIC (Enforces Complete 3D Object Anatomy)
+                x_crit = F.interpolate(x_aug, size=(224, 224), mode='bicubic', align_corners=False)
+                x_crit_norm = (x_crit - imagenet_mean) / imagenet_std
+                crit_logits = spatial_critic(x_crit_norm)
+                crit_probs = F.softmax(crit_logits, dim=-1)
+                batch_crit_mask = cifar_imagenet_mask[y_tensor]  # (B, 1000)
+                spatial_conf = (crit_probs * batch_crit_mask).sum(dim=-1)
+                loss_spatial = -torch.log(spatial_conf + 1e-6).mean()
+
+                # 5. MULTI-CROP ZOOMED PATCH DETAIL (Phase-Specific)
                 crop_sz = torch.randint(crop_min, crop_max + 1, (1,)).item()
                 top = torch.randint(0, 128 - crop_sz + 1, (1,)).item()
                 left = torch.randint(0, 128 - crop_sz + 1, (1,)).item()
@@ -375,33 +422,34 @@ def main():
                 patch_logits = patch_sims * logit_scale + logit_bias
                 loss_patch = F.binary_cross_entropy_with_logits(patch_logits, target_mask)
 
-                # 5. LAPLACIAN HIGH-FREQUENCY EDGE FLOOR
+                # 6. LAPLACIAN HIGH-FREQUENCY EDGE FLOOR
                 edge_energy = laplacian(x128_1)
                 loss_sharpness = torch.relu(0.045 - edge_energy).mean()
 
-                # 6. Negative Prompt Repulsion
+                # 7. Negative Prompt Repulsion
                 neg_sims = torch.matmul(img_embeds, neg_embeds.t()).max(dim=-1)[0]
                 loss_neg = torch.relu(neg_sims).mean()
 
-                # 7. Balanced Contrast Range (prevents both fog and extreme polarization)
+                # 8. Balanced Contrast Range
                 per_img_std = x128_1.std(dim=[-2, -1])  # (B, 3)
                 loss_contrast = torch.relu(0.20 - per_img_std).mean() + torch.relu(per_img_std - 0.32).mean()
 
-                # 8. Anti-Washout Exposure Guard (Penalizes blown-out whites and crushed blacks)
+                # 9. Anti-Washout Exposure Guard
                 loss_exposure = torch.relu(x128_1 - 0.92).pow(2).mean() + torch.relu(0.04 - x128_1).pow(2).mean()
 
-                # 9. Natural Daylight Color Moments
+                # 10. Natural Daylight Color Moments
                 batch_m = x128_1.mean(dim=[0, 2, 3], keepdim=True)
                 batch_s = x128_1.std(dim=[0, 2, 3], keepdim=True)
                 loss_color = F.mse_loss(batch_m, target_mean) + F.mse_loss(batch_s, target_std)
 
-                # 10. Slashed Total Variation
+                # 11. Slashed Total Variation
                 tv_loss = torch.mean(torch.abs(x128_1[:, :, :, :-1] - x128_1[:, :, :, 1:])) + \
                           torch.mean(torch.abs(x128_1[:, :, :-1, :] - x128_1[:, :, 1:, :]))
 
                 # TOTAL CURRICULUM OBJECTIVE
                 loss_total = (args.lambda_siglip * loss_siglip) + \
                              (args.lambda_patch * loss_patch) + \
+                             (args.lambda_spatial * loss_spatial) + \
                              (args.lambda_sharpness * loss_sharpness) + \
                              (args.lambda_contrast * loss_contrast) + \
                              (args.lambda_exposure * loss_exposure) + \
@@ -416,6 +464,8 @@ def main():
 
             total_loss += loss_total.item()
             total_siglip_loss += loss_siglip.item()
+            total_spatial_loss += loss_spatial.item()
+            total_spatial_conf += spatial_conf.mean().item()
             total_sim += target_sims.mean().item()
             total_edge += edge_energy.mean().item()
             total_div += diff_img.item()
@@ -424,26 +474,28 @@ def main():
 
         avg_loss = total_loss / args.batches_per_epoch
         avg_sig = total_siglip_loss / args.batches_per_epoch
+        avg_spatial = total_spatial_loss / args.batches_per_epoch
+        avg_spconf = total_spatial_conf / args.batches_per_epoch
         avg_sim = total_sim / args.batches_per_epoch
         avg_edge = total_edge / args.batches_per_epoch
         avg_div = total_div / args.batches_per_epoch
 
         # Sample grid every 10 epochs
         if epoch % 10 == 0 or epoch == 1:
-            print(f"[{active_phase}] Epoch {epoch:04d}/{args.epochs:04d} | SigLIP: {avg_sig:.4f} | Cos Sim: {avg_sim:.4f} | Edge: {avg_edge:.4f} | Total: {avg_loss:.4f}")
+            print(f"[{active_phase}] Epoch {epoch:04d}/{args.epochs:04d} | SigLIP: {avg_sig:.4f} | Spatial: {avg_spatial:.4f} (Conf: {avg_spconf:.1%}) | Edge: {avg_edge:.4f} | Total: {avg_loss:.4f}")
 
             generator.eval()
             with torch.no_grad():
-                samples = generator(fixed_z, fixed_y)
+                samples = generator(fixed_z, fixed_y, steps=args.steps)
                 save_image(samples, os.path.join(args.output_dir, f"sample_epoch_{epoch:04d}.png"), nrow=5, normalize=False)
 
         elif epoch % 2 == 0:
-            print(f"[{active_phase}] Epoch {epoch:04d}/{args.epochs:04d} | SigLIP: {avg_sig:.4f} | Cos Sim: {avg_sim:.4f} | Edge: {avg_edge:.4f} | Total: {avg_loss:.4f}")
+            print(f"[{active_phase}] Epoch {epoch:04d}/{args.epochs:04d} | SigLIP: {avg_sig:.4f} | Spatial: {avg_spatial:.4f} (Conf: {avg_spconf:.1%}) | Edge: {avg_edge:.4f} | Total: {avg_loss:.4f}")
 
     # Final save
     final_path = os.path.join(args.output_dir, "generator_vlm_final.pth")
     torch.save(generator.state_dict(), final_path)
-    print(f"\n>>> Curriculum Synthesis Complete! Final model saved to: {final_path}")
+    print(f"\n>>> Recurrent Feedback Synthesis Complete! Final model saved to: {final_path}")
 
 
 if __name__ == "__main__":

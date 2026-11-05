@@ -26,5 +26,7 @@ venv/
 !results_multiscale_generator/**.png
 !results_128_generator/
 !results_128_generator/**.png
+!results_vlm_generator/
+!results_vlm_generator/**.png
 
 

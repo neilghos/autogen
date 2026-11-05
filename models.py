@@ -54,14 +54,16 @@ class DecoderResBlock(nn.Module):
 
 class MultiScaleDecoderGenerator(nn.Module):
     """
-    Multi-Scale Progressive Decoder Generator for CIFAR-10 (3x32x32).
+    Multi-Scale Progressive Decoder Generator (3x128x128).
     
     Architecture Hierarchy:
       - Latent Mapping Network: [z (128) + y_emb (64)] -> w (256)
-      - Stage 1 (4x4, 256ch):   Initial spatial seed (global class composition)
-      - Stage 2 (8x8, 192ch):   Upsample + ResBlock -> Coarse RGB (8x8 macro-shapes, horizon/sky/ground)
-      - Stage 3 (16x16, 128ch): Upsample + ResBlock -> Mid-level RGB (16x16 limbs, wheels, textures)
-      - Stage 4 (32x32, 64ch):  Upsample + ResBlock -> Fine RGB (32x32 micro-edits, eyes, crisp contours)
+      - Stage 1 (4x4, 256ch):    Initial spatial seed (global class composition)
+      - Stage 2 (8x8, 192ch):    Upsample + ResBlock -> Coarse RGB (8x8 macro-shapes, horizon/sky/ground)
+      - Stage 3 (16x16, 128ch):  Upsample + ResBlock -> Mid-level RGB (16x16 limbs, wheels, textures)
+      - Stage 4 (32x32, 96ch):   Upsample + ResBlock -> Anatomy RGB (32x32 object contour, primary features)
+      - Stage 5 (64x64, 64ch):   Upsample + ResBlock -> Surface RGB (64x64 textures, plumage, reflections)
+      - Stage 6 (128x128, 32ch): Upsample + ResBlock -> Fine RGB (128x128 micro-edits, eyes, crisp contours)
       
     Multi-Scale RGB Skip Paths ensure gradient flow directly into every resolution tier.
     """
@@ -90,13 +92,21 @@ class MultiScaleDecoderGenerator(nn.Module):
         self.block_8 = DecoderResBlock(base_channels, 192, upsample=True)
         self.to_rgb_8 = nn.Conv2d(192, 3, kernel_size=1)
         
-        # 4. Stage 3: 8x8 -> 16x16 (Mid-level textures & parts)
+        # 4. Stage 3: 8x8 -> 16x16 (Mid-level parts)
         self.block_16 = DecoderResBlock(192, 128, upsample=True)
         self.to_rgb_16 = nn.Conv2d(128, 3, kernel_size=1)
         
-        # 5. Stage 4: 16x16 -> 32x32 (Micro-edits, crisp contours)
-        self.block_32 = DecoderResBlock(128, 64, upsample=True)
-        self.to_rgb_32 = nn.Conv2d(64, 3, kernel_size=3, padding=1)
+        # 5. Stage 4: 16x16 -> 32x32 (Anatomy & shapes)
+        self.block_32 = DecoderResBlock(128, 96, upsample=True)
+        self.to_rgb_32 = nn.Conv2d(96, 3, kernel_size=1)
+
+        # 6. Stage 5: 32x32 -> 64x64 (Surface details)
+        self.block_64 = DecoderResBlock(96, 64, upsample=True)
+        self.to_rgb_64 = nn.Conv2d(64, 3, kernel_size=1)
+
+        # 7. Stage 6: 64x64 -> 128x128 (Micro-edits, crisp contours)
+        self.block_128 = DecoderResBlock(64, 32, upsample=True)
+        self.to_rgb_128 = nn.Conv2d(32, 3, kernel_size=3, padding=1)
 
     def forward(self, z, labels, return_all_scales=False):
         c = self.label_emb(labels)
@@ -117,12 +127,20 @@ class MultiScaleDecoderGenerator(nn.Module):
         # Stage 4: 32x32 (Residual addition from 16x16)
         h32 = self.block_32(h16)
         rgb_32 = self.to_rgb_32(h32) + F.interpolate(rgb_16, scale_factor=2, mode='bilinear', align_corners=False)
+
+        # Stage 5: 64x64 (Residual addition from 32x32)
+        h64 = self.block_64(h32)
+        rgb_64 = self.to_rgb_64(h64) + F.interpolate(rgb_32, scale_factor=2, mode='bilinear', align_corners=False)
+
+        # Stage 6: 128x128 (Residual addition from 64x64)
+        h128 = self.block_128(h64)
+        rgb_128 = self.to_rgb_128(h128) + F.interpolate(rgb_64, scale_factor=2, mode='bilinear', align_corners=False)
         
-        out_32 = torch.sigmoid(rgb_32)
+        out_128 = torch.sigmoid(rgb_128)
         
         if return_all_scales:
-            out_8 = torch.sigmoid(rgb_8)
-            out_16 = torch.sigmoid(rgb_16)
-            return out_32, out_16, out_8
+            out_64 = torch.sigmoid(rgb_64)
+            out_32 = torch.sigmoid(rgb_32)
+            return out_128, out_64, out_32
             
-        return out_32
+        return out_128

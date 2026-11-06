@@ -50,10 +50,10 @@ CIFAR_TO_IMAGENET = {
 }
 
 # ==============================================================================
-# MULTI-SCALE CURRICULUM PROMPT SYSTEM (250 Epochs per Phase)
+# ALTERNATING CURRICULUM PROMPT SYSTEM (Alternates Every 100 Epochs)
 # ==============================================================================
 
-# Phase 1 (Epochs 1 - 250): Full Scene & Complete Bounding Box
+# Phase 1: Full Scene & Complete Bounding Box (Macro wide-angle, grounds terrain & horizon)
 CURRICULUM_PHASE_1_MACRO = [
     "a wide angle photo of a complete passenger airplane parked on airport tarmac under clear daylight sky",
     "a wide angle photo of a complete automobile car centered driving on an open asphalt road in daylight",
@@ -63,26 +63,12 @@ CURRICULUM_PHASE_1_MACRO = [
     "a wide angle photo of a complete domestic dog standing on a green grass field outdoors",
     "a wide angle photo of a complete green amphibian frog resting in a natural wet outdoor environment",
     "a wide angle photo of a complete equine horse standing in a rural grassy pasture",
-    "a wide angle photo of a complete wooden sailing ship floating on open ocean water under daytime sky",
+    "a wide angle photo of a complete wooden sailing ship floating on open ocean water under daylight sky",
     "a wide angle photo of a complete commercial freight motor truck driving on a paved highway road"
 ]
 
-# Phase 2 (Epochs 251 - 500): Structural Anatomy, Contours & Primary Parts
-CURRICULUM_PHASE_2_ANATOMY = [
-    "a sharp focused photo of a whole passenger airplane showing wings, fuselage body, cockpit, and tail fin",
-    "a sharp focused photo of an entire automobile car showing vehicle body doors, windshield glass, hood, and wheels",
-    "a sharp focused photo of an entire wild bird showing head, beak, wings, tail feathers, and perched legs",
-    "a sharp focused photo of a full body domestic cat showing pointed ears, head profile, feline body, and tail",
-    "a sharp focused photo of a full body wild deer showing head with branched antlers, four slender legs, and torso",
-    "a sharp focused photo of a full body domestic dog showing canine head, muzzle, ears, four legs, and tail",
-    "a sharp focused photo of an entire green tree frog showing frog head with protruding eyes, moist throat, and legs",
-    "a sharp focused photo of a full body equine horse showing muscular neck, head, equestrian body, and four legs",
-    "a sharp focused photo of an entire wooden sailing ship showing carved ship hull, tall masts, and rigging sails",
-    "a sharp focused photo of an entire commercial motor truck showing truck cab, front grille, side mirrors, and wheels"
-]
-
-# Phase 3 (Epochs 501+): Micro-Textures, Surface Speculars & Fine Physics (Applied strictly to patch crops)
-CURRICULUM_PHASE_3_MICRO = [
+# Phase 2 (Former Phase 3): Micro-Textures, Surface Speculars & Fine Physics (Applied to patch crops)
+CURRICULUM_PHASE_2_MICRO = [
     "detailed texture of passenger airplane polished aluminum rivets, jet engine intake turbine, and wing seams",
     "detailed texture of automobile deep rubber tire tread grooves, alloy wheel rims, and glass headlights",
     "detailed texture of wild bird plumage feather barbules, dark pupil eye, and sharp pointed beak",
@@ -119,8 +105,9 @@ class LaplacianSharpness(nn.Module):
 
 class StochasticJitter(nn.Module):
     """
-    Stochastic jitter and scale perturbation on 128x128 resolution.
-    Breaks ViT patch grid phase-lock and eradicates scanlines/checkerboards.
+    Differentiable stochastic spatial jitter:
+    - Translation shifts (+- pad)
+    - Random horizontal flip
     """
     def __init__(self, pad=8, img_size=128):
         super().__init__()
@@ -128,73 +115,67 @@ class StochasticJitter(nn.Module):
         self.img_size = img_size
 
     def forward(self, x):
-        # 1. Reflection pad and random translation crop
-        x_pad = F.pad(x, (self.pad, self.pad, self.pad, self.pad), mode='reflect')
+        # 1. Random horizontal flip
+        mask = torch.rand(x.size(0), 1, 1, 1, device=x.device) > 0.5
+        x = torch.where(mask, torch.flip(x, dims=[-1]), x)
+
+        # 2. Random translation pad & crop
+        x_pad = F.pad(x, (self.pad, self.pad, self.pad, self.pad), mode='replicate')
         h = torch.randint(0, 2 * self.pad + 1, (1,), device=x.device).item()
         w = torch.randint(0, 2 * self.pad + 1, (1,), device=x.device).item()
-        x_crop = x_pad[:, :, h:h + self.img_size, w:w + self.img_size]
-
-        # 2. Scale jitter breaks ViT patch grid phase-lock (eradicates scanlines)
-        scale = 0.94 + 0.12 * torch.rand(1, device=x.device).item()
-        s_dim = int(round(self.img_size * scale))
-        x_scaled = F.interpolate(x_crop, size=(s_dim, s_dim), mode='bilinear', align_corners=False)
-        return F.interpolate(x_scaled, size=(self.img_size, self.img_size), mode='bilinear', align_corners=False)
+        return x_pad[:, :, h:h + self.img_size, w:w + self.img_size]
 
 
-def extract_tensor(feat):
-    """Safely extracts torch.Tensor from any HuggingFace ModelOutput object."""
-    if isinstance(feat, torch.Tensor):
-        return feat
-    if hasattr(feat, "pooler_output") and feat.pooler_output is not None:
-        return feat.pooler_output
-    if hasattr(feat, "text_embeds") and feat.text_embeds is not None:
-        return feat.text_embeds
-    if hasattr(feat, "image_embeds") and feat.image_embeds is not None:
-        return feat.image_embeds
-    if hasattr(feat, "last_hidden_state") and feat.last_hidden_state is not None:
-        return feat.last_hidden_state[:, 0]
-    return feat[0]
+def extract_tensor(x):
+    """Safely extracts a torch.Tensor from ModelOutput or tuple structures."""
+    if isinstance(x, torch.Tensor):
+        return x
+    if hasattr(x, "pooler_output") and x.pooler_output is not None:
+        return x.pooler_output
+    if hasattr(x, "last_hidden_state") and x.last_hidden_state is not None:
+        return x.last_hidden_state[:, 0]
+    if hasattr(x, "image_embeds") and x.image_embeds is not None:
+        return x.image_embeds
+    if hasattr(x, "text_embeds") and x.text_embeds is not None:
+        return x.text_embeds
+    if isinstance(x, (tuple, list)):
+        return extract_tensor(x[0])
+    raise TypeError(f"Cannot extract tensor from type: {type(x)}")
 
 
 def load_siglip_judge(device):
     """
-    Loads Google's SigLIP (google/siglip-base-patch16-224) in FP16.
-    Replaces BLIP's toxic cross-attention sinks with smooth, non-adversarial sigmoid gradients.
-    VRAM footprint: ~600 MB.
+    Loads frozen Google SigLIP judge (google/siglip-base-patch16-224).
     """
-    print("[SigLIP Judge] Loading Google's SigLIP (google/siglip-base-patch16-224)...")
+    print("[SigLIP Judge] Loading google/siglip-base-patch16-224...")
     try:
-        from transformers import AutoModel, AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained("google/siglip-base-patch16-224")
-        model = AutoModel.from_pretrained(
-            "google/siglip-base-patch16-224",
-            torch_dtype=torch.float16
-        ).to(device)
+        from transformers import AutoProcessor, AutoModel
+        processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-224")
+        model = AutoModel.from_pretrained("google/siglip-base-patch16-224").to(device).half()
         model.eval()
         for p in model.parameters():
             p.requires_grad = False
-        print("[SigLIP Judge] Loaded successfully via transformers.\n")
-        return tokenizer, model
+        print("[SigLIP Judge] Loaded via Hugging Face Transformers.\n")
+        return processor.tokenizer, model
     except Exception as e:
-        print(f"[SigLIP Judge] Transformers load failed ({e}), attempting open_clip fallback...")
+        print(f"[SigLIP Judge] HF loader failed ({e}), falling back to open_clip...")
+        import open_clip
+        model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-16-SigLIP', pretrained='webli')
+        model = model.to(device).half()
+        tokenizer = open_clip.get_tokenizer('ViT-B-16-SigLIP')
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad = False
+        print("[SigLIP Judge] Loaded via open_clip.\n")
+        return tokenizer, model
 
-    import open_clip
-    model, _, _ = open_clip.create_model_and_transforms('ViT-B-16-SigLIP', pretrained='webli', device=device)
-    tokenizer = open_clip.get_tokenizer('ViT-B-16-SigLIP')
-    model.eval().half()
-    for p in model.parameters():
-        p.requires_grad = False
-    print("[SigLIP Judge] Loaded successfully via open_clip.\n")
-    return tokenizer, model
 
-
-def load_spatial_critic(device):
+def load_spatial_critic(device, model_name="convnext_femto.d1_in1k"):
     """
-    Loads frozen pretrained ConvNeXt Femto (convnext_femto.d1_in1k) in FP16.
-    Enforces global 3D geometric coherence and full-object topology.
+    Loads pretrained ConvNeXt Femto classifier on ImageNet-1k as the Spatial Critic.
     """
-    print("[Spatial Critic] Loading ConvNeXt Femto (convnext_femto.d1_in1k)...")
-    model = timm.create_model("convnext_femto.d1_in1k", pretrained=True).to(device)
+    print(f"[Spatial Critic] Loading pretrained {model_name}...")
+    model = timm.create_model(model_name, pretrained=True).to(device)
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
@@ -217,24 +198,22 @@ def encode_prompts(prompts, tokenizer, model, device):
 
 def precompute_curriculum_anchors(tokenizer, model, device):
     """
-    Precomputes normalized SigLIP text embeddings for all 3 curriculum phases.
+    Precomputes normalized SigLIP text embeddings for both curriculum phases.
     """
     print("[Curriculum Engine] Precomputing multi-scale prompt embeddings...")
     embeds_p1 = encode_prompts(CURRICULUM_PHASE_1_MACRO, tokenizer, model, device)
-    embeds_p2 = encode_prompts(CURRICULUM_PHASE_2_ANATOMY, tokenizer, model, device)
-    embeds_p3 = encode_prompts(CURRICULUM_PHASE_3_MICRO, tokenizer, model, device)
+    embeds_p2 = encode_prompts(CURRICULUM_PHASE_2_MICRO, tokenizer, model, device)
     embeds_neg = encode_prompts(NEGATIVE_PROMPTS, tokenizer, model, device)
     print("  - Phase 1 (Macro):", embeds_p1.shape)
-    print("  - Phase 2 (Anatomy):", embeds_p2.shape)
-    print("  - Phase 3 (Micro):", embeds_p3.shape)
+    print("  - Phase 2 (Micro):", embeds_p2.shape)
     print("  - Negative:", embeds_neg.shape, "\n")
-    return embeds_p1, embeds_p2, embeds_p3, embeds_neg
+    return embeds_p1, embeds_p2, embeds_neg
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Recurrent Feedback Generator with SigLIP + ConvNeXt")
-    parser.add_argument("--epochs", type=int, default=750, help="Total training epochs (Default: 750 = 3 x 250 phases)")
-    parser.add_argument("--phase_length", type=int, default=250, help="Epoch duration for each curriculum phase")
+    parser = argparse.ArgumentParser(description="Recurrent Feedback Generator with Alternating Macro/Micro Curriculum")
+    parser.add_argument("--epochs", type=int, default=500, help="Total training epochs (Default: 500)")
+    parser.add_argument("--phase_cycle", type=int, default=100, help="Epochs per phase before alternating (Default: 100)")
     parser.add_argument("--batches_per_epoch", type=int, default=15, help="Batches per epoch")
     parser.add_argument("--samples_per_class", type=int, default=2, help="Samples per class per batch (Default: 2 -> Batch size = 20)")
     parser.add_argument("--latent_dim", type=int, default=128, help="Latent noise vector dimension")
@@ -267,7 +246,7 @@ def main():
 
     # 1. Load Google SigLIP Judge
     tokenizer, siglip = load_siglip_judge(device)
-    embeds_p1, embeds_p2, embeds_p3, neg_embeds = precompute_curriculum_anchors(tokenizer, siglip, device)
+    embeds_p1, embeds_p2, neg_embeds = precompute_curriculum_anchors(tokenizer, siglip, device)
 
     # 2. Load Pretrained ConvNeXt Spatial Critic
     spatial_critic = load_spatial_critic(device)
@@ -291,13 +270,12 @@ def main():
     # 3. Recurrent Feedback Decoder Generator (128x128)
     batch_size = 10 * args.samples_per_class
     print("=" * 72)
-    print("RECURRENT FEEDBACK AUTOREGRESSIVE GENERATOR")
+    print("RECURRENT FEEDBACK AUTOREGRESSIVE GENERATOR (ALTERNATING CURRICULUM)")
     print(f"  - Canvas Resolution: 128 x 128 native pixels")
     print(f"  - Feedback Recurrence Steps: {args.steps} iterations / image")
-    print(f"  - Phase Length: {args.phase_length} epochs each")
-    print(f"    * Phase 1 (1 - {args.phase_length}): Full Scene & Complete Bounding Box")
-    print(f"    * Phase 2 ({args.phase_length + 1} - {2 * args.phase_length}): Structural Anatomy & Contours")
-    print(f"    * Phase 3 ({2 * args.phase_length + 1}+): Micro-Textures & Fine Physics")
+    print(f"  - Alternation Cycle: Every {args.phase_cycle} epochs")
+    print(f"    * Phase 1 (Macro): Full Scene & Complete Bounding Box")
+    print(f"    * Phase 2 (Micro): Micro-Textures, Speculars & Fine Physics on Patches")
     print(f"  - Spatial Topology Critic: ConvNeXt Femto (ImageNet-1k) Active (Weight: {args.lambda_spatial})")
     print(f"  - Batches/Epoch: {args.batches_per_epoch} | Batch Size: {batch_size}")
     print("=" * 72 + "\n")
@@ -320,24 +298,19 @@ def main():
     current_phase = 0
 
     for epoch in range(1, args.epochs + 1):
-        # Determine Curriculum Phase
-        if epoch <= args.phase_length:
+        # Determine Curriculum Phase (Alternating every phase_cycle epochs: 1-100, 101-200, 201-300...)
+        cycle_idx = (epoch - 1) // args.phase_cycle
+        if cycle_idx % 2 == 0:
             active_phase = 1
-            phase_title = "Phase 1: Full Scene & Complete Bounding Box"
+            phase_title = "Phase 1: Full Scene & Complete Bounding Box (Macro)"
             active_global_embeds = embeds_p1
             active_patch_embeds = embeds_p1
             crop_min, crop_max = 64, 96
-        elif epoch <= 2 * args.phase_length:
-            active_phase = 2
-            phase_title = "Phase 2: Structural Anatomy & Contours"
-            active_global_embeds = embeds_p2
-            active_patch_embeds = embeds_p2
-            crop_min, crop_max = 56, 84
         else:
-            active_phase = 3
-            phase_title = "Phase 3: Micro-Textures & Fine Physics"
-            active_global_embeds = embeds_p2
-            active_patch_embeds = embeds_p3
+            active_phase = 2
+            phase_title = "Phase 2: Micro-Textures & Fine Surface Physics (Micro)"
+            active_global_embeds = embeds_p1
+            active_patch_embeds = embeds_p2
             crop_min, crop_max = 48, 72
 
         if active_phase != current_phase:
